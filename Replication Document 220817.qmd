@@ -1,0 +1,1867 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+# Elaboration of Database
+
+### Load required packages
+
+```{r}
+pacman::p_load(chilemapas,tidyr,dplyr,readr,readxl,gdata,stringr,writexl,
+               stargazer,fixest,plm,lmtest,lubridate,janitor,modelsummary, 
+               ggplot2, reshape, magrittr, purrr, biscale, cowplot, sf, stringr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+
+options(scipen = 999) #to prevent scientific notation
+```
+
+### Create empty dataframe
+
+This first stage consists on the elaboration of an empty dataframe. This dataframe will serve as a vassel where ACLED and INDH data will be pasted. This dataframe consists of one date per municipality (comuna), counting from the first day of protest (18 October 2019) to the last date (31 March 2020).
+
+Load municipalities: I will use the R package chilemapas that consist of all Chilean municipalities. This will serve as a standard in term of names for the three administrative levels (regions, provinces, and municipalities).
+
+```{r}
+codigos_territoriales <- (chilemapas::codigos_territoriales)
+```
+
+Create panel dataframe:
+
+```{r}
+comunas_panel <- data.frame()
+for(i in 1:nrow(codigos_territoriales))  {   
+  dates <- data.frame(date = seq(from = as.Date("2019-10-18"), 
+                               to = as.Date("2020-03-31"), by = 1))
+  comunas_panel = rbind(comunas_panel, dates)
+}
+
+comunas_panel <- comunas_panel %>%
+  arrange(date)
+
+# Extract names of municipalities
+comunas <- codigos_territoriales[,2]
+comunas <- comunas %>% slice(rep(row_number(), 166))
+comunas_panel_final <- cbind(comunas_panel,comunas)
+
+# Check that every municipality has 166 observations
+comunas_panel_final %>%
+  count(nombre_comuna)
+```
+
+```{r}
+unique(comunas_panel_final$nombre_comuna)
+```
+
+### Load ACLED data
+
+Original ACLED data as downloaded through the website.\
+Event type: protests, riots\
+Actor type: protesters, rioters, civilians\
+Dates: 18 October 2019 to 31 March 2020
+
+```{r}
+acled_data <- read_csv("2019-10-18-2020-03-31-Chile.csv", 
+                       col_types = cols(event_date = 
+                                          col_date(format = "%d %B %Y")))
+
+# Modify inconsistent municipality names
+acled_data$nombre_comuna <- acled_data$admin3
+
+acled_data$nombre_comuna[is.na(acled_data$nombre_comuna)] = 
+  "Santiago" #All NAs are from Santiago
+
+acled_data$nombre_comuna[acled_data$nombre_comuna == "Coyhaique"] <- "Coihaique"
+acled_data$nombre_comuna[acled_data$nombre_comuna == "Aysen"] <- "Aisen"
+acled_data$nombre_comuna[acled_data$nombre_comuna == 
+                           "Padre Las Casas"] <- "Padre las Casas"
+
+acled_data$date <- acled_data$event_date
+class(acled_data$date) #Date
+
+# Generate counting variables for protests and riots
+# Divide the db into two, one for protests and one for riots
+acled_data_protests <- acled_data[acled_data$event_type == "Protests", ]
+acled_data_protests <- acled_data_protests %>%
+  group_by(nombre_comuna, date) %>%
+  summarize(protest_total = n())
+
+acled_data_riots <- acled_data[acled_data$event_type == "Riots", ]
+acled_data_riots <- acled_data_riots %>%
+  group_by(nombre_comuna, date) %>%
+  summarize(riots_total = n())
+head(acled_data_riots)
+```
+
+Transfer data into comunas_panel_final
+
+```{r}
+final_df <- full_join(comunas_panel_final, acled_data_protests, 
+                      by = c("nombre_comuna", "date")) 
+final_df <- full_join(final_df, acled_data_riots, by = 
+                        c("nombre_comuna", "date")) 
+
+length(unique(final_df$nombre_comuna)) #346
+
+final_df$protest_total[is.na(final_df$protest_tota)] = 0
+final_df$riots_total[is.na(final_df$riots_total)] = 0
+
+# Create a new variable "total events" that sums protests and riots
+final_df$events_total <- rowSums(subset(final_df, select=3:4))
+```
+
+### Add INDH data
+
+Source: Mapa de Violaciones a los Derechos Humanos elaborated by the National Institute of Human rights (INDH) available here:\
+https://mapaviolacionesddhh.indh.cl/public/investigadores
+
+```{r}
+indh <- read_excel("BBDD Violaciones a los derechos humanos crsis social octubre 2019 marzo 2020.xlsx")
+names(indh)
+```
+
+Clean database to leave only the used variables, and rename\
+Folio -\> id\
+Fecha del delito -\> date\
+Comuna1 -\> nombre_comuna\
+Hecho1 -\> repressive_type_original\
+Tipo de lugar1 -\> location
+
+```{r}
+indh_clean <- select(indh, "Folio", "Fecha del delito", "Comuna1", 
+                     "Hecho1", "Tipo de lugar1")
+
+indh_clean <- rename.vars(indh_clean, from = c("Folio", "Fecha del delito", 
+                                               "Comuna1", "Hecho1", 
+                                               "Tipo de lugar1"),
+                          to = c(c("id", "date", "nombre_comuna", 
+                                   "repressive_type_original",
+                                   "location")))
+
+head(indh_clean)
+```
+
+Drop NAs
+
+```{r}
+indh_clean <- indh_clean %>% drop_na() # from 2838 obs to 2784
+class(indh_clean$date)
+
+indh_clean$date <- as.Date(indh_clean$date, format = "%Y-%m-%d")
+class(indh_clean$date)
+
+# Drop observations from 17 October 2019
+indh_clean <- indh_clean[!(indh_clean$date == "2019-10-17"),] #2782 obs
+```
+
+Change inconsistent municipality to standardize names
+
+```{r}
+# Drop cases with no information for municipalities (value "Anonimizado")
+indh_clean <- indh_clean[!(indh_clean$nombre_comuna == "Anonimazdo"),] #2779 obs
+
+# Remove trailing white space after municipality name
+indh_clean$nombre_comuna <- str_trim(indh_clean$nombre_comuna)
+
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Cañete"] <- "Canete"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Chillán"] <- "Chillan"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Cañete"] <- "Canete"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Concepción"] <- "Concepcion"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Conchalí"] <- "Conchali"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Copiapó"] <- "Copiapo"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Coyhaique"] <- "Coihaique"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Curacaví"] <- "Curacavi"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Curicó"] <- "Curico"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Estación Central"] <- "Estacion Central"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "La florida"] <- "La Florida"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "La serena"] <- "La Serena"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Hualpén"] <- "Hualpen"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "La Unión"] <- "La Union"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Llolleo"] <- "San Antonio"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Los Ángeles"] <- "Los Angeles"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Machalí"] <- "Machali"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Macúl"] <- "Macul"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Maipú"] <- "Maipu"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Maullín"] <- "Maullin"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Mauillín"] <- "Maullin"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Ñuñoa"] <- "Nunoa"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Padre de las Casas"] <- "Padre las Casas"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Peñaflor"] <- "Penaflor"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Peñalolén"] <- "Penalolen"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Puente alto"] <- "Puente Alto"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Pucón"] <- "Pucon"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Pucón"] <- "Pucon"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Puerto Aysén"] <- "Aisen"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Puerto Natales"] <- "Natales"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Quellón"] <- "Quellon"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Quilpué"] <- "Quilpue"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Quinteros"] <- "Quintero"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Río Bueno"] <- "Rio Bueno"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Río Negro"] <- "Rio Negro"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "San Joaquín"] <- "San Joaquin"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "San José de Maipo"] <- "San Jose de Maipo"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "San Ramón"] <- "San Ramon"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "San Vicente de Tagua-Tagua"] <- "San Vicente"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Santa Bárbara"] <- "Santa Barbara"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Santiago Centro"] <- "Santiago"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Tomé"] <- "Tome"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Valparaíso"] <- "Valparaiso"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Ventanas"] <- "Puchuncavi"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Vicuña"] <- "Vicuna"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == "Villarica"] <- "Villarrica"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Viña del Mar"] <- "Vina del Mar"
+indh_clean$nombre_comuna[indh_clean$nombre_comuna == 
+                           "Viña del mar"] <- "Vina del Mar"
+```
+
+Create categories for repressive events
+
+```{r}
+tabyl(indh_clean$repressive_type_original, sort = TRUE) #23 tipos
+```
+
+```{r}
+indh_clean$repression_recod <- NA
+
+# Non-physical abuse
+indh_clean$repression_recod[indh_clean$repressive_type_original 
+                            == "Amenaza"] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original 
+                            == "Amenaza de muerte"] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Destrucción de objetos personales "] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Estigmatización"] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Ingreso no autorizado"] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Invasión del hogar"] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Rotura de teléfono"] <- "Non-physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Seguimiento"] <- "Non-physical Abuse"
+
+# Physical abuse
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Asfixia"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Ataque con animales"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Atropello"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Desnudamiento"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Obstrucción de asistencia médica"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Otros"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Piedrazo"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Quemado"] <- "Physical Abuse"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Tocaciones"] <- "Physical Abuse"
+
+# Arrest
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Detención"] <- "Arrest"
+
+# Beating
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Golpiza"] <- "Beating"
+
+# Non-lethal weapons
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Disparos"] <- "Non-lethal Weapons"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Gaseado"] <- "Non-lethal Weapons"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Impacto de chorro"] <- "Non-lethal Weapons"
+indh_clean$repression_recod[indh_clean$repressive_type_original == 
+                              "Mojado con productos químicos "] <- "Non-lethal Weapons"
+
+# Join non-physical with physical
+indh_clean$repression_recod2 <- NA
+
+indh_clean$repression_recod2[indh_clean$repression_recod == "Arrest"] <- "Arrest"
+indh_clean$repression_recod2[indh_clean$repression_recod == "Beating"] <- "Beating"
+indh_clean$repression_recod2[indh_clean$repression_recod == 
+                               "Non-lethal Weapons"] <- "Non-lethal Weapons"
+indh_clean$repression_recod2[indh_clean$repression_recod == 
+                               "Non-physical Abuse"] <- "Abuse"
+indh_clean$repression_recod2[indh_clean$repression_recod == 
+                               "Physical Abuse"] <- "Abuse"
+
+tabyl(indh_clean$repression_recod2)
+```
+
+Separate dataframe according to repression_recod2 to count repressive events
+
+```{r}
+indh_abuse <- indh_clean[indh_clean$repression_recod2 == "Abuse", ]
+indh_abuse <- indh_abuse %>%
+  group_by(nombre_comuna, date) %>%
+  summarize(abuse_total = n())
+
+indh_arrest <- indh_clean[indh_clean$repression_recod2 == "Arrest", ]
+indh_arrest <- indh_arrest %>%
+  group_by(nombre_comuna, date) %>%
+  summarize(arrest_total = n())
+
+indh_beating <- indh_clean[indh_clean$repression_recod2 == "Beating", ]
+indh_beating <- indh_beating %>%
+  group_by(nombre_comuna, date) %>%
+  summarize(beating_total = n())
+
+indh_nonlethal <- indh_clean[indh_clean$repression_recod2 == 
+                               "Non-lethal Weapons", ]
+indh_nonlethal <- indh_nonlethal %>%
+  group_by(nombre_comuna, date) %>%
+  summarize(nonlethal_total = n())
+```
+
+### Transfer data into final_df
+
+```{r}
+final_df2 <- full_join(final_df, indh_abuse, by = c("nombre_comuna", "date")) 
+final_df2 <- full_join(final_df2, indh_arrest, by = c("nombre_comuna", "date")) 
+final_df2 <- full_join(final_df2, indh_beating, by = c("nombre_comuna", "date")) 
+final_df2 <- full_join(final_df2, indh_nonlethal, by = c("nombre_comuna", "date")) 
+
+length(unique(final_df$date)) #166
+length(unique(final_df2$date)) #167?
+
+length(unique(final_df$nombre_comuna))
+length(unique(final_df2$nombre_comuna))
+
+final_df2$abuse_total[is.na(final_df2$abuse_total)] = 0
+final_df2$arrest_total[is.na(final_df2$arrest_total)] = 0
+final_df2$beating_total[is.na(final_df2$beating_total)] = 0
+final_df2$nonlethal_total[is.na(final_df2$nonlethal_total)] = 0
+
+# Create a new variable "total events" that sums protests and riots
+final_df2$repression_total <- rowSums(subset(final_df2, select=6:9))
+
+final_df2 <- final_df2 %>% drop_na()
+length(unique(final_df2$nombre_comuna)) #346
+length(unique(final_df2$date)) #166
+```
+
+### Add information CCTV cameras
+
+```{r}
+final_df3 <- final_df2
+
+final_df3$total_cctv <- 0
+final_df3$total_cctv[final_df3$nombre_comuna == 
+                       "Antofagasta" & final_df3$date <= "2019-10-27"] <- "24"
+final_df3$total_cctv[final_df3$nombre_comuna == 
+                       "Antofagasta" & final_df3$date >= "2019-10-28"] <- "23"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Castro"] <- "3"
+final_df3$total_cctv[final_df3$nombre_comuna == "Cauquenes"] <- "6"
+final_df3$total_cctv[final_df3$nombre_comuna == "Cerrillos"] <- "2"
+final_df3$total_cctv[final_df3$nombre_comuna == "Chiguayante"] <- "4"
+
+final_df3$total_cctv[final_df3$nombre_comuna == 
+                       "Concepcion" & final_df3$date <= "2019-10-24"] <- "22"
+final_df3$total_cctv[final_df3$nombre_comuna == 
+                       "Concepcion" & final_df3$date >= "2019-10-25"] <- "21"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Conchali"] <- "1"
+final_df3$total_cctv[final_df3$nombre_comuna == "Concon"] <- "3"
+
+final_df3$total_cctv[final_df3$nombre_comuna == 
+                       "Coquimbo" & final_df3$date <= "2019-10-18"] <- "12"
+final_df3$total_cctv[final_df3$nombre_comuna == "Coquimbo" & 
+                    final_df3$date >= "2019-10-19" & final_df3$date 
+                    <= "2020-02-09"] <- "4"
+final_df3$total_cctv[final_df3$nombre_comuna == "Coquimbo" & 
+                       final_df3$date >= "2020-02-10"] <- "3"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Coronel"] <- "7"
+final_df3$total_cctv[final_df3$nombre_comuna == "Curico"] <- "8"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Estacion Central" 
+                     & final_df3$date <= "2019-11-18"] <- "10"
+final_df3$total_cctv[final_df3$nombre_comuna == "Estacion Central" & 
+                       final_df3$date >= "2019-11-19" & final_df3$date 
+                     <= "2020-03-02"] <- "12"
+final_df3$total_cctv[final_df3$nombre_comuna == "Estacion Central" & 
+                       final_df3$date >= "2020-03-03"] <- "11"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Huechuraba"] <- "4"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Independencia" 
+                     & final_df3$date <= "2020-03-10"] <- "4"
+final_df3$total_cctv[final_df3$nombre_comuna == "Independencia" 
+                     & final_df3$date >= "2020-03-11"] <- "3"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "La Cisterna"] <- "2"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "La Florida" & 
+                       final_df3$date <= "2019-10-21"] <- "16"
+final_df3$total_cctv[final_df3$nombre_comuna == "La Florida" & 
+                       final_df3$date >= "2019-10-22"] <- "14"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "La Granja"] <- "1"
+final_df3$total_cctv[final_df3$nombre_comuna == "La Reina"] <- "8"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "La Serena" & 
+                       final_df3$date <= "2019-10-18"] <- "17"
+final_df3$total_cctv[final_df3$nombre_comuna == "La Serena" & 
+                       final_df3$date >= "2019-10-19" & 
+                       final_df3$date <= "2019-10-22"] <- "15"
+final_df3$total_cctv[final_df3$nombre_comuna == "La Serena" & 
+                       final_df3$date >= "2019-10-23" & 
+                       final_df3$date <= "2019-12-12"] <- "14"
+final_df3$total_cctv[final_df3$nombre_comuna == "La Serena" & 
+                       final_df3$date >= "2019-12-13" & 
+                       final_df3$date <= "2020-01-23"] <- "13"
+final_df3$total_cctv[final_df3$nombre_comuna == "La Serena" & 
+                       final_df3$date >= "2020-01-24"] <- "16"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Las Condes" & 
+                       final_df3$date <= "2019-10-21"] <- "46"
+final_df3$total_cctv[final_df3$nombre_comuna == "Las Condes" & 
+                       final_df3$date >= "2019-10-22" & 
+                       final_df3$date <= "2020-02-05"] <- "43"
+final_df3$total_cctv[final_df3$nombre_comuna == "Las Condes" & 
+                       final_df3$date >= "2020-02-05"] <- "42"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Lo Barnechea"] <- "16"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Lo Prado" & 
+                       final_df3$date <= "2019-11-12"] <- "2"
+final_df3$total_cctv[final_df3$nombre_comuna == "Lo Prado" & 
+                       final_df3$date >= "2019-11-13"] <- "1"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Machali"] <- "3"
+final_df3$total_cctv[final_df3$nombre_comuna == "Macul"] <- "8"
+final_df3$total_cctv[final_df3$nombre_comuna == "Maipu"] <- "7"
+final_df3$total_cctv[final_df3$nombre_comuna == "Nunoa"] <- "10"
+final_df3$total_cctv[final_df3$nombre_comuna == "Osorno"] <- "7"
+final_df3$total_cctv[final_df3$nombre_comuna == "Padre las Casas"] <- "1"
+final_df3$total_cctv[final_df3$nombre_comuna == "Pedro Aguirre Cerda"] <- "3"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Penalolen" & 
+                       final_df3$date <= "2019-10-21"] <- "9"
+final_df3$total_cctv[final_df3$nombre_comuna == "Penalolen" & 
+                       final_df3$date >= "2019-10-22" & 
+                       final_df3$date <= "2020-03-11"] <- "8"
+final_df3$total_cctv[final_df3$nombre_comuna == "Penalolen" & 
+                       final_df3$date >= "2020-03-12"] <- "7"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Pirque"] <- "1"
+final_df3$total_cctv[final_df3$nombre_comuna == "Providencia"] <- "37"
+final_df3$total_cctv[final_df3$nombre_comuna == "Puente Alto"] <- "9"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Puerto Montt" & 
+                       final_df3$date <= "2020-01-05"] <- "22"
+final_df3$total_cctv[final_df3$nombre_comuna == "Puerto Montt" & 
+                       final_df3$date >= "2020-01-05"] <- "23"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Quilicura"] <- "5"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Quilpue" & 
+                       final_df3$date <= "2019-10-27"] <- "12"
+final_df3$total_cctv[final_df3$nombre_comuna == "Quilpue" & 
+                       final_df3$date >= "2019-10-28" & 
+                       final_df3$date <= "2019-11-10"] <- "9"
+final_df3$total_cctv[final_df3$nombre_comuna == "Quilpue" & 
+                       final_df3$date >= "2019-11-11"] <- "8"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Rancagua" & 
+                       final_df3$date <= "2019-11-30"] <- "18"
+final_df3$total_cctv[final_df3$nombre_comuna == "Rancagua" & 
+                       final_df3$date >= "2019-12-01"] <- "23"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Recoleta"] <- "5"
+final_df3$total_cctv[final_df3$nombre_comuna == "Renca"] <- "1"
+final_df3$total_cctv[final_df3$nombre_comuna == "Rengo"] <- "1"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "San Bernardo" & 
+                       final_df3$date <= "2020-03-11"] <- "3"
+final_df3$total_cctv[final_df3$nombre_comuna == "San Bernardo" & 
+                       final_df3$date >= "2020-03-12"] <- "2"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "San Fernardo"] <- "4"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "San Joaquin" & 
+                       final_df3$date <= "2020-02-16"] <- "5"
+final_df3$total_cctv[final_df3$nombre_comuna == "San Joaquin" & 
+                       final_df3$date >= "2020-02-17"] <- "4"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "San Miguel" & 
+                       final_df3$date <= "2020-02-27"] <- "5"
+final_df3$total_cctv[final_df3$nombre_comuna == "San Miguel" & 
+                       final_df3$date >= "2020-02-28"] <- "4"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "San Pedro de la Paz" & 
+                       final_df3$date <= "2020-03-12"] <- "6"
+final_df3$total_cctv[final_df3$nombre_comuna == "San Pedro de la Paz" & 
+                       final_df3$date >= "2020-03-13" & 
+                       final_df3$date <= "2020-03-16"] <- "7"
+final_df3$total_cctv[final_df3$nombre_comuna == "San Pedro de la Paz" & 
+                       final_df3$date >= "2020-03-17" & 
+                       final_df3$date <= "2020-03-19"] <- "9"
+final_df3$total_cctv[final_df3$nombre_comuna == "San Pedro de la Paz" & 
+                       final_df3$date >= "2020-03-20"] <- "10"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "San Ramon"] <- "1"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Santiago" & 
+                       final_df3$date <= "2019-10-21"] <- "51"
+final_df3$total_cctv[final_df3$nombre_comuna == "Santiago" & 
+                       final_df3$date >= "2019-10-22" & 
+                       final_df3$date <= "2019-11-10"] <- "48"
+final_df3$total_cctv[final_df3$nombre_comuna == "Santiago" & 
+                       final_df3$date >= "2019-11-11"] <- "47"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Talca"] <- "9"
+final_df3$total_cctv[final_df3$nombre_comuna == "Talcahuano"] <- "3"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Temuco" & 
+                       final_df3$date <= "2020-01-30"] <- "16"
+final_df3$total_cctv[final_df3$nombre_comuna == "Temuco" & 
+                       final_df3$date >= "2020-01-31" & 
+                       final_df3$date <= "2020-02-27"] <- "17"
+final_df3$total_cctv[final_df3$nombre_comuna == "Temuco" & 
+                       final_df3$date >= "2020-02-28"] <- "16"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Valparaiso" & 
+                       final_df3$date <= "2019-10-20"] <- "15"
+final_df3$total_cctv[final_df3$nombre_comuna == "Valparaiso" & 
+                       final_df3$date >= "2019-10-21" & 
+                       final_df3$date <= "2019-10-27"] <- "14"
+final_df3$total_cctv[final_df3$nombre_comuna == "Valparaiso" & 
+                       final_df3$date >= "2019-10-28" & 
+                       final_df3$date <= "2019-11-12"] <- "13"
+final_df3$total_cctv[final_df3$nombre_comuna == "Valparaiso" & 
+                       final_df3$date >= "2019-11-13" & 
+                       final_df3$date <= "2019-11-21"] <- "12"
+final_df3$total_cctv[final_df3$nombre_comuna == "Valparaiso" & 
+                       final_df3$date >= "2019-11-22"] <- "11"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Villa Alemana"] <- "4"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Villarrica" & 
+                       final_df3$date <= "2020-03-21"] <- "15"
+final_df3$total_cctv[final_df3$nombre_comuna == "Villarrica" & 
+                       final_df3$date >= "2020-03-22"] <- "8"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Vina del Mar" & 
+                       final_df3$date <= "2019-11-07"] <- "29"
+final_df3$total_cctv[final_df3$nombre_comuna == "Vina del Mar" & 
+                       final_df3$date >= "2019-11-08" & 
+                       final_df3$date <= "2019-11-10"] <- "28"
+final_df3$total_cctv[final_df3$nombre_comuna == "Vina del Mar" & 
+                       final_df3$date >= "2019-11-11"] <- "21"
+
+final_df3$total_cctv[final_df3$nombre_comuna == "Vitacura" & 
+                       final_df3$date <= "2020-01-27"] <- "14"
+final_df3$total_cctv[final_df3$nombre_comuna == "Vitacura" & 
+                       final_df3$date >= "2020-01-28" & 
+                       final_df3$date <= "2020-03-19"] <- "13"
+final_df3$total_cctv[final_df3$nombre_comuna == "Vitacura" & 
+                       final_df3$date >= "2020-03-20"] <- "12"
+
+final_df3$total_cctv <- as.numeric(final_df3$total_cctv)
+class(final_df3$date)
+
+pdim(final_df3) #Balanced Panel: n = 166, T = 346, N = 57436
+```
+
+Standardize manually
+
+```{r}
+#standardize manually
+final_df3_st <- final_df3
+final_df3_st <- final_df3_st %>%
+  mutate(events_total = (events_total - mean(events_total))/sd(events_total),
+         abuse_total = (abuse_total - mean(abuse_total))/sd(abuse_total),
+         arrest_total = (arrest_total - mean(arrest_total))/sd(arrest_total),
+         beating_total = (beating_total - mean(beating_total))/sd(beating_total),
+         nonlethal_total = (nonlethal_total - mean(nonlethal_total))/sd(nonlethal_total),
+         total_cctv = (total_cctv - mean(total_cctv))/sd(total_cctv))
+
+head(final_df3_st)
+```
+
+```{r}
+mean(final_df3_st$events_total)
+sd(final_df3_st$events_total)
+```
+
+Remove all additional databases
+
+```{r}
+rm(acled_data, acled_data_protests, acled_data_riots, codigos_territoriales,
+   comunas, comunas_panel, comunas_panel_final, dates, indh, indh_abuse,
+   indh_arrest, indh_beating, indh_clean, indh_nonlethal, final_df, final_df2)
+```
+
+# Replication of Submitted Paper
+
+### Descriptive statistics
+
+```{r}
+stargazer(final_df3, type = "text")
+```
+
+### Baseline OLS model
+
+```{r}
+baseline <-lm(events_total ~ abuse_total + arrest_total + beating_total + 
+                nonlethal_total, data = final_df3_st)
+
+stargazer(baseline, type = "text") # Table 2, same as in paper
+```
+
+### PLM with FE
+
+```{r}
+fe_lag1 <-  plm(events_total ~ plm::lag(abuse_total,1) + plm::lag(arrest_total,1) + 
+                plm::lag(beating_total,1) + plm::lag(nonlethal_total,1) + 
+                plm::lag(events_total,1), model = "within", 
+                index=c("nombre_comuna", "date"), 
+                data = final_df3_st, effect = "twoways")
+
+fe_lag1_lag2 <- plm(events_total ~ plm::lag(abuse_total,1) + 
+                    plm::lag(abuse_total,2) + plm::lag(arrest_total,1) + 
+                    plm::lag(arrest_total,2) + plm::lag(beating_total,1) + 
+                    plm::lag(beating_total,2) + plm::lag(nonlethal_total,1) + 
+                    plm::lag(nonlethal_total,2) + plm::lag(events_total,1) +
+                    plm::lag(events_total,2), 
+                    model = "within", index=c("nombre_comuna", "date"), 
+                    data = final_df3_st, effect = "twoways")
+
+# Cluster SE by group and time
+cov1_fe_lag1 <- vcovDC(fe_lag1, type = "HC1") #double cluster
+robust_se_fe_lag1 <- sqrt(diag(cov1_fe_lag1)) 
+
+cov1_fe_lag1_lag2 <- vcovDC(fe_lag1_lag2, type = "HC1") #double cluster
+robust_se_fe_lag1_lag2 <- sqrt(diag(cov1_fe_lag1_lag2))
+
+# Stargazer output (with and without RSE)
+stargazer(fe_lag1, fe_lag1_lag2,
+          se = list(robust_se_fe_lag1, robust_se_fe_lag1_lag2),
+          single.row = FALSE, type = "text") #same as in paper
+```
+
+# Additional analysis post-submission
+
+### Use particular repressive actions
+
+Separate dataframe according to repressive_type_original
+
+```{r}
+# Join amenaza y amenaza de muerte
+indh_clean_2 <- indh_clean
+indh_clean_2$repressive_type_original[indh_clean_2$repressive_type_original == "Amenaza de muerte"] <- "Amenaza"
+unique(indh_clean_2$repressive_type_original) ## 
+tabyl(indh_clean_2$repressive_type_original) 
+```
+
+```{r}
+# Join rotura de teléfono con destrucción de objetos personales
+indh_clean_2$repressive_type_original[indh_clean_2$repressive_type_original == "Rotura de teléfono"] <- "Destrucción de objetos personales"
+unique(indh_clean_2$repressive_type_original) # 21 categorías
+tabyl(indh_clean_2$repressive_type_original) 
+```
+
+Create particular categories INDH data
+
+```{r}
+disparos <- indh_clean_2[indh_clean_2$repressive_type_original == "Disparos", ]
+disparos %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(disparos_total = n())
+
+golpiza <- indh_clean_2[indh_clean_2$repressive_type_original == "Golpiza", ]
+golpiza %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(golpiza_total = n())
+
+amenaza <- indh_clean_2[indh_clean_2$repressive_type_original == "Amenaza", ]
+amenaza %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(amenaza_total = n())
+
+detencion <- indh_clean_2[indh_clean_2$repressive_type_original == "Detención", ]
+detencion %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(detencion_total = n())
+
+atropello <- indh_clean_2[indh_clean_2$repressive_type_original == "Atropello", ]
+atropello %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(atropello_total = n())
+
+asfixia <- indh_clean_2[indh_clean_2$repressive_type_original == "Asfixia", ]
+asfixia %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(asfixia_total = n())
+
+invasion_hogar <- indh_clean_2[indh_clean_2$repressive_type_original == "Invasión del hogar", ]
+invasion_hogar %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(invasion_hogar_total = n())
+
+ingreso <- indh_clean_2[indh_clean_2$repressive_type_original == "Ingreso no autorizado", ]
+ingreso %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(ingreso_total = n())
+
+#no incluir otros
+
+gaseado <- indh_clean_2[indh_clean_2$repressive_type_original == "Gaseado", ]
+gaseado %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(gaseado_total = n())
+
+piedrazo <- indh_clean_2[indh_clean_2$repressive_type_original == "Piedrazo", ]
+piedrazo %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(piedrazo_total = n())
+
+ataque_animales <- indh_clean_2[indh_clean_2$repressive_type_original == "Ataque con animales", ]
+ataque_animales %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(ataque_animales_total = n())
+
+guanaco <- indh_clean_2[indh_clean_2$repressive_type_original == "Impacto de chorro", ]
+guanaco %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(guanaco_total = n())
+
+obstruccion <- indh_clean_2[indh_clean_2$repressive_type_original == "Obstrucción de asistencia médica", ]
+obstruccion %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(obstruccion_total = n())
+
+tocaciones <- indh_clean_2[indh_clean_2$repressive_type_original == "Tocaciones", ]
+tocaciones %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(tocaciones_total = n())
+
+quemado <- indh_clean_2[indh_clean_2$repressive_type_original == "Quemado", ]
+quemado %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(quemado_total = n())
+
+estigmatizacion <- indh_clean_2[indh_clean_2$repressive_type_original == "Estigmatización", ]
+estigmatizacion %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(estigmatizacion_total = n())
+
+destruccion_objetos <- indh_clean_2[indh_clean_2$repressive_type_original == "Destrucción de objetos personales", ]
+destruccion_objetos %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(destruccion_objetos_total = n())
+
+seguimiento <- indh_clean_2[indh_clean_2$repressive_type_original == "Seguimiento", ]
+seguimiento %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(seguimiento_total = n())
+
+desnudamiento <- indh_clean_2[indh_clean_2$repressive_type_original == "Desnudamiento", ]
+desnudamiento %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(desnudamiento_total = n())
+
+mojado <- indh_clean_2[indh_clean_2$repressive_type_original == "Mojado con productos químicos", ]
+mojado %<>%
+  group_by(nombre_comuna, date) %>%
+  summarize(mojado_total = n())
+```
+
+Transfer new data to final_df3_2
+
+```{r}
+final_df3_all <- final_df3
+
+final_df3_all <- full_join(final_df3_all, disparos, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, golpiza, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, amenaza, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, detencion, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, atropello, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, asfixia, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, invasion_hogar, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, ingreso, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, gaseado, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, piedrazo, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, ataque_animales, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, guanaco, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, obstruccion, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, tocaciones, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, quemado, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, estigmatizacion, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, destruccion_objetos, by=c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, seguimiento, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, desnudamiento, by = c("nombre_comuna", "date")) 
+final_df3_all <- full_join(final_df3_all, mojado, by = c("nombre_comuna", "date")) 
+
+# Replace NAs for 0s
+final_df3_all <- final_df3_all %>% replace(is.na(.), 0)
+length(unique(final_df3_all$nombre_comuna)) #346
+length(unique(final_df3_all$date)) #166
+```
+
+```{r}
+final_df3_all_panel <- pdata.frame(final_df3_all, index = c("nombre_comuna", "date"))
+head(final_df3_all)
+
+table(final_df3_all$detencion_total)
+table(final_df3_all$arrest_total) #both are the same
+```
+
+Create histogram to evaluate poisson model
+
+```{r}
+ggplot(final_df3_all, aes(x = events_total)) + 
+  geom_histogram(binwidth=1)
+```
+
+Make a time series graph with the evolution of all police repressive acts
+
+```{r}
+final_df3_all$date <- as.Date(final_df3_all$date, format = "%Y-%Om-%d")
+class(final_df3_all$date)
+
+#Group by date
+final_df3_all_daily <- final_df3_all %>% 
+  group_by(date) %>% 
+  summarise_if(is.numeric, sum)
+
+#Group by week
+final_df3_all_weekly <- final_df3_all %>% 
+  group_by(week = cut(date, "week")) %>% 
+  summarise_if(is.numeric, sum)
+
+#Group by municipality and week
+final_df3_all_weekly_comuna <- final_df3_all %>% 
+  group_by(week = cut(date, "week"), nombre_comuna) %>% 
+  summarise_if(is.numeric, sum)
+
+#Group by municipality
+final_df3_all_comuna <- final_df3_all %>% 
+  group_by(nombre_comuna) %>% 
+  summarise_if(is.numeric, sum)
+
+#Hacer una BBDD aparte que identifique que comunas tuvieron cero protestas y cero represion
+comunas_sin <- final_df3_all_comuna %>%
+  filter(events_total == 0 & total_repression_eight == 0) #142 comunas sin nada
+
+# Filtrar final_df3_all para eliminar las comunas sin nada
+data_no_comunaszero <- anti_join(final_df3_all,comunas_sin, by ="nombre_comuna")
+
+class(final_df3_all_weekly$week)
+final_df3_all_weekly$week <- as.Date(final_df3_all_weekly$week, format = "%Y-%Om-%d")
+
+class(final_df3_all_weekly_comuna$week)
+final_df3_all_weekly_comuna$week <- as.Date(final_df3_all_weekly_comuna$week, format = "%Y-%Om-%d")
+
+ggplot(final_df3_all_weekly,aes(week,repression_total)) + geom_line(color="blue") + 
+  geom_line(aes(week,events_total),color="black") 
+
+ggplot(final_df3_all_daily,aes(date,repression_total)) + geom_line(color="blue") + 
+  geom_line(aes(date,events_total),color="black") 
+```
+
+Es
+
+```{r}
+plot(final_df3_all$repression_total, final_df3_all$events_total,main="Observed")
+```
+
+### Estimate GLM Poisson models
+
+I can't include instrumental variables with GLM...
+
+```{r}
+glm_disparos_t0 <- feglm(events_total ~ disparos_total | nombre_comuna + date, 
+                    final_df3_all, family = "poisson")
+
+glm_disparos_t1 <- feglm(events_total ~ disparos_total + l(disparos_total,-1) | 
+                       nombre_comuna + date, final_df3_all, family = "poisson", 
+                     panel.id=c('nombre_comuna', 'date'))
+
+glm_disparos_t2 <- feglm(events_total ~ disparos_total + l(disparos_total,-1) + 
+                           l(disparos_total,-2) | 
+                       nombre_comuna + date, final_df3_all, family = "poisson", 
+                     panel.id=c('nombre_comuna', 'date'))
+
+glm_disparos_t3 <- feglm(events_total ~ disparos_total + l(disparos_total,-1) + 
+                           l(disparos_total,-2) + l(disparos_total,-3)| 
+                       nombre_comuna + date, final_df3_all, family = "poisson", 
+                     panel.id=c('nombre_comuna', 'date'))
+
+glm_disparos_t4 <- feglm(events_total ~ disparos_total + l(disparos_total,-1) + 
+                           l(disparos_total,-2) + l(disparos_total,-3) + 
+                           l(disparos_total,-4)| 
+                       nombre_comuna + date, final_df3_all, family = "poisson", 
+                     panel.id=c('nombre_comuna', 'date'))
+
+modelsummary(list(glm_disparos_t0, glm_disparos_t1, glm_disparos_t2, glm_disparos_t3,
+                  glm_disparos_t4), 
+             stars = TRUE, output = "markdown")
+```
+
+```{r}
+disparos_t0 <-  plm(events_total ~ disparos_total, model = "within", 
+                index=c("nombre_comunadate"), 
+                data = final_df3_all, effect = "twoways")
+
+disparos_t1 <-  plm(events_total ~ disparos_total + plm::lag(disparos_total,1), 
+                    model = "within", index=c("nombre_comuna", "date"), 
+                    data = final_df3_all, effect = "twoways")
+
+disparos_t2 <- plm(events_total ~ disparos_total + plm::lag(disparos_total,1) +
+                   plm::lag(disparos_total,2), model = "within", 
+                   index=c("nombre_comuna", "date"),
+                   data = final_df3_all, effect = "twoways")
+
+disparos_t3 <- plm(events_total ~ disparos_total + plm::lag(disparos_total,1) + 
+                   plm::lag(disparos_total,2) + plm::lag(disparos_total,3),
+                   model = "within", index=c("nombre_comuna", "date"),
+                   data = final_df3_all, effect = "twoways")
+
+disparos_t4 <- plm(events_total ~ disparos_total +  plm::lag(disparos_total,1) + 
+                   plm::lag(disparos_total,2) + plm::lag(disparos_total,3) + 
+                   plm::lag(disparos_total,4), 
+                   model = "within", index=c("nombre_comuna", "date"),
+                   data = final_df3_all, effect = "twoways")
+
+disparos_t5 <- plm(events_total ~ disparos_total + plm::lag(disparos_total,1) +
+                   plm::lag(disparos_total,2) + plm::lag(disparos_total,3) +
+                   plm::lag(disparos_total,4) + plm::lag(disparos_total,5),
+                   model = "within", index=c("nombre_comuna", "date"),
+                   data = final_df3_all, effect = "twoways")
+
+disparos_t6 <- plm(events_total ~ disparos_total + plm::lag(disparos_total,1) +
+                   plm::lag(disparos_total,2) + plm::lag(disparos_total,3) +
+                   plm::lag(disparos_total,4) + plm::lag(disparos_total,5) +
+                   plm::lag(disparos_total,6), model = "within", 
+                   index=c("nombre_comuna", "date"), data = final_df3_all, effect = "twoways")
+
+disparos_t7 <- plm(events_total ~ disparos_total + plm::lag(disparos_total,1) + 
+                   plm::lag(disparos_total,2) + plm::lag(disparos_total,3) +
+                   plm::lag(disparos_total,4) + plm::lag(disparos_total,5) +
+                   plm::lag(disparos_total,6) + plm::lag(disparos_total,7),
+                   model = "within", index=c("nombre_comuna", "date"),
+                   data = final_df3_all, effect = "twoways")
+
+modelsummary(list(disparos_t0, disparos_t1, disparos_t2, disparos_t3, 
+                  disparos_t4, disparos_t5, disparos_t6, disparos_t7), 
+             stars = TRUE, output = "markdown")
+```
+
+All the 20 types of repressive acts
+
+```{r}
+all_repression_t0 <-  plm(riots_total ~ disparos_total + golpiza_total + amenaza_total +
+                          detencion_total + atropello_total + asfixia_total + 
+                          invasion_hogar_total + ingreso_total + gaseado_total +
+                          piedrazo_total + ataque_animales_total + guanaco_total +
+                          obstruccion_total + tocaciones_total + quemado_total + 
+                          estigmatizacion_total + destruccion_objetos_total +
+                          seguimiento_total + desnudamiento_total + mojado_total + 
+                          lag(events_total,1) + lag(events_total,2), 
+                          model = "within", 
+                          index=c("nombre_comuna", "date"), 
+                          data = final_df3_all, effect = "twoways")
+
+all_repression_t1 <-  plm(riots_total ~ lag(disparos_total,1) + lag(golpiza_total,1) +
+                          lag(amenaza_total,1) + lag(detencion_total,1) + 
+                          lag(atropello_total,1) + lag(asfixia_total,1) +
+                          lag(invasion_hogar_total,1) + lag(ingreso_total,1) + 
+                          lag(gaseado_total,1) + lag(piedrazo_total,1) + 
+                          lag(ataque_animales_total,1) + lag(guanaco_total,1) +
+                          lag(obstruccion_total,1) + lag(tocaciones_total,1) + 
+                          lag(quemado_total,1) + lag(estigmatizacion_total,1) + 
+                          lag(destruccion_objetos_total,1) + lag(seguimiento_total,1) + 
+                          lag(desnudamiento_total,1) + lag(mojado_total,1) + 
+                          lag(events_total,1) + lag(events_total,2), 
+                          model = "within", 
+                          index=c("nombre_comuna", "date"), 
+                          data = final_df3_all, effect = "twoways")
+
+stargazer(all_repression_t0, all_repression_t1, type = "text")
+
+all_repression_t1 <-  plm(events_total ~ disparos_total + plm::lag(disparos_total,1), 
+                    model = "within", index=c("nombre_comuna", "date"), 
+                    data = final_df3_all, effect = "twoways")
+```
+
+## New analysis for new version of the paper
+
+Time series for protests and repression
+
+```{r}
+ts_data_repression <- final_df3_all %>%
+  group_by(date) %>%
+  summarise(repression_sum = sum(repression_total))
+
+ts_data_repression <- melt(ts_data_repression, id=c("date")) 
+
+ts_data_events <- final_df3_all %>%
+  group_by(date) %>%
+  summarise(events_sum = sum(events_total))
+
+ts_data_events <- melt(ts_data_events, id=c("date")) 
+
+ts_data <- rbind(ts_data_repression, ts_data_events)
+
+ts_data$variable <- as.character(ts_data$variable)
+
+ts_data$variable[ts_data$variable == "repression_sum"] <- "Repression"
+ts_data$variable[ts_data$variable == "events_sum"] <- "Protest"
+
+ggplot(ts_data, aes(x = date, y = value)) +
+  geom_line(aes(color = variable), size = 0.5) +
+  labs(color = "") +
+  theme_bw() +
+  xlab("Date") + ylab("Number of occurrences") +
+  scale_color_manual(values=c("#707B7C", "#C0392B")) +
+  theme(legend.position="top")
+```
+
+El 15 de noviembre fue el acuerdo por la paz social...a fines de noviembre ya pararon las protestas...qué pasa si corto la base ahí?
+
+Create new variable that combines guanaco + mojado
+
+```{r}
+final_df3_all %<>%
+  rowwise() %>%
+  mutate(mojado_guanaco_total = sum(c_across(guanaco_total|mojado_total)),
+         invasion_ingreso_total = sum(c_across(invasion_hogar_total|ingreso_total)))
+
+#Delete previous variables to avoid confussion
+final_df3_all %<>% dplyr::select(-c(guanaco_total,mojado_total,
+                                    invasion_hogar_total,ingreso_total))
+
+#Create variable total represive acts
+final_df3_all %<>%
+  rowwise() %>%
+  mutate(total_repression = sum(c_across(disparos_total|golpiza_total|amenaza_total|
+                                         detencion_total|atropello_total|asfixia_total|
+                                         gaseado_total|piedrazo_total|ataque_animales_total|
+                                         obstruccion_total|tocaciones_total|quemado_total|
+                                         estigmatizacion_total|destruccion_objetos_total|
+                                         seguimiento_total|desnudamiento_total|
+                                         mojado_guanaco_total|invasion_ingreso_total)))#18
+
+final_df3_all %<>%
+  rowwise() %>%
+  mutate(total_repression_eight = sum(c_across(disparos_total|golpiza_total|
+                                      detencion_total|gaseado_total|mojado_guanaco_total|
+                                      amenaza_total|atropello_total|invasion_ingreso_total)))
+```
+
+Frequency table
+
+```{r}
+freq_table <- final_df3_all %>%
+  group_by() %>%
+  summarise_at(vars(disparos_total, golpiza_total, amenaza_total, detencion_total,
+                    atropello_total, asfixia_total, invasion_ingreso_total,
+                    gaseado_total, piedrazo_total, ataque_animales_total,
+                    obstruccion_total, tocaciones_total, quemado_total, 
+                    estigmatizacion_total, destruccion_objetos_total, seguimiento_total,
+                    desnudamiento_total, mojado_guanaco_total), sum)
+
+freq_table2 <- freq_table %>%
+  tibble::rownames_to_column() %>% 
+  gather(repression_type, value, -rowname) %>% 
+  spread(rowname, value) 
+
+#Rename rows
+freq_table2 %<>%
+  mutate(repression_type = recode (repression_type, amenaza_total = "Threats",
+                                   asfixia_total = "Asphyxia",
+                                   ataque_animales_total = "Attack with Animals",
+                                   atropello_total = "Hit by a car",
+                                   desnudamiento_total = "Stripping",
+                                   destruccion_objetos_total = "Destruction personal items",
+                                   detencion_total = "Detention",
+                                   disparos_total = "Shooting",
+                                   estigmatizacion_total = "Stigmatization",
+                                   gaseado_total = "Gassed",
+                                   golpiza_total = "Beating",
+                                   invasion_ingreso_total = "Entering/home invasion",
+                                   mojado_guanaco_total = "Water impact",
+                                   obstruccion_total = "Obstruction medical assistance",
+                                   piedrazo_total = "Stone throwing",
+                                   quemado_total = "Burned",
+                                   seguimiento_total = "Follow up",
+                                   tocaciones_total = "Touching"))
+
+
+colnames(freq_table2)[2] <- "frequency"
+
+freq_table2 %<>% mutate(percentage=100*frequency/sum(frequency))
+write_xlsx(freq_table2,"distribution.xlsx")
+
+freq_table2 %<>% filter(frequency >=10) %>%
+  mutate(percentage=100*frequency/sum(frequency))
+
+sum(freq_table2$percentage) #100
+sum(freq_table2$frequency) #2733
+```
+
++----------------------------+------------------------+-------------+
+| Var_name_raw               | Variable name          | freq        |
++----------------------------+------------------------+-------------+
+| 1.  disparos_total         | Shooting               | 1258        |
++----------------------------+------------------------+-------------+
+| 2.  golpiza_total          | Beating                | 956         |
++----------------------------+------------------------+-------------+
+| 3.  detencion_total        | Detention              | 274         |
++----------------------------+------------------------+-------------+
+| 4.  gaseado_total          | Gassed                 | 91          |
++----------------------------+------------------------+-------------+
+| 5.  mojado_guanaco_total   | Water impact           | 47          |
++----------------------------+------------------------+-------------+
+| 6.  amenaza_total          | Threats                | 40          |
++----------------------------+------------------------+-------------+
+| 7.  atropello_total        | Hit by a car           | 37          |
++----------------------------+------------------------+-------------+
+| 8.  invasion_ingreso_total | Entering/home invasion | 30          |
++----------------------------+------------------------+-------------+
+
+Frequency table by region and month
+
+```{r}
+#Region
+#Include region in database
+#Use nombre_comuna and nombre_region frm codigos_territoriales
+
+table_region <- final_df3_all %>%
+  left_join(codigos_territoriales, by = "nombre_comuna")
+
+table_region %<>%
+  group_by(nombre_region) %>%
+  summarize(total_repression = sum(total_repression_eight)) %>%
+  mutate(perc_repression=100*total_repression/sum(total_repression))
+
+sum(table_region$total_repression)
+```
+
+```{r}
+#Month
+table_month <- final_df3_all %>% 
+  group_by(month = lubridate::floor_date(date, "month")) %>%
+  summarize(disparos_total = sum(disparos_total),
+            golpiza_total = sum(golpiza_total),
+            detencion_total = sum(detencion_total),
+            gaseado_total = sum(gaseado_total),
+            mojado_guanaco_total = sum(mojado_guanaco_total),
+            amenaza_total = sum(amenaza_total),
+            atropello_total = sum(atropello_total),
+            invasion_ingreso_total = sum(invasion_ingreso_total),
+            total_repression = sum(total_repression_eight)) %>%
+  mutate(perc_repression=100*total_repression/sum(total_repression))
+
+sum(table_month$total_repression)
+
+sum(table_month$invasion_ingreso_total)
+```
+
+### Estimación de modelos sin categorías represivas (raw data)
+
+Modelo sin lags
+
+```{r}
+#Tabla appendice
+model1_nolag <- feols(events_total ~ disparos_total + 
+                gaseado_total + mojado_guanaco_total + golpiza_total +
+                detencion_total + invasion_ingreso_total + amenaza_total + 
+                atropello_total | nombre_comuna + date, #8 repressive acts
+                data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model1_nolag), stars = TRUE, output = "markdown", 
+             title = "Models without lags")
+```
+
+```{r}
+model_lag1 <- feols(events_total ~ l(events_total,1) + l(disparos_total,1) + 
+                l(gaseado_total,1) + l(mojado_guanaco_total,1) + l(golpiza_total,1) +
+                l(detencion_total,1) + l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) | nombre_comuna + date,
+                data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_lag2 <- feols(events_total ~ l(events_total,1) + l(events_total,2) + 
+                l(disparos_total,1) + l(gaseado_total,1) + 
+                l(mojado_guanaco_total,1) + l(golpiza_total,1) + l(detencion_total,1) + 
+                l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) + l(disparos_total,2) + l(gaseado_total,2) + 
+                l(mojado_guanaco_total,2) + l(golpiza_total,2) + l(detencion_total,2) + 
+                l(invasion_ingreso_total,2) + l(amenaza_total,2) + 
+                l(atropello_total,2)| nombre_comuna + date,
+                data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_lag3 <- feols(events_total ~ l(events_total,1) + l(events_total,2) + l(events_total,3) +
+                l(disparos_total,1) + l(gaseado_total,1) + 
+                l(mojado_guanaco_total,1) + l(golpiza_total,1) + l(detencion_total,1) + 
+                l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) + l(disparos_total,2) + l(gaseado_total,2) + 
+                l(mojado_guanaco_total,2) + l(golpiza_total,2) + l(detencion_total,2) + 
+                l(invasion_ingreso_total,2) + l(amenaza_total,2) + 
+                l(atropello_total,2) + l(disparos_total,3) + l(gaseado_total,3) + 
+                l(mojado_guanaco_total,3) + l(golpiza_total,3) + l(detencion_total,3) + 
+                l(invasion_ingreso_total,3) + l(amenaza_total,3) + 
+                l(atropello_total,3)| nombre_comuna + date,
+                data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+
+modelsummary(list(model_lag1, model_lag2, model_lag3), 
+             stars = TRUE, output = "markdown", title = "Models with lags")
+```
+
+Model raw_t2 is the one works better
+
+```{r}
+# Nuevos modelos solo hasta el 30 de noviembre
+
+#final_df_short <- final_df3_all %>%
+#  filter(date <= "2019-11-30")
+
+models <- list(
+  "T-1 and T-2" = feols(events_total ~ l(events_total,1) + l(events_total,2) + 
+                l(disparos_total,1) + l(gaseado_total,1) + 
+                l(mojado_guanaco_total,1) + l(golpiza_total,1) + l(detencion_total,1) + 
+                l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) + l(disparos_total,2) + l(gaseado_total,2) + 
+                l(mojado_guanaco_total,2) + l(golpiza_total,2) + l(detencion_total,2) + 
+                l(invasion_ingreso_total,2) + l(amenaza_total,2) + 
+                l(atropello_total,2)| nombre_comuna + date,
+                data = final_df3_all, panel.id = c("nombre_comuna", "date")))
+
+coefs <- c('l(atropello_total, 2)' = 'Hit by a car t-2',
+           'l(atropello_total, 1)' = 'Hit by a car t-1',
+           'l(amenaza_total, 2)' = 'Threats t-2',
+           'l(amenaza_total, 1)' = 'Threats t-1',
+           'l(invasion_ingreso_total, 2)' = 'Unauthorized entry/invasion t-2',
+           'l(invasion_ingreso_total, 1)' = 'Unauthorized entry/invasion t-1',
+           'l(detencion_total, 2)' = 'Arrest t-2',
+           'l(detencion_total, 1)' = 'Arrest t-1',
+           'l(golpiza_total, 2)' = 'Beating t-2',
+           'l(golpiza_total, 1)' = 'Beating t-1',
+           'l(mojado_guanaco_total, 2)' = 'Water impact t-2',
+           'l(mojado_guanaco_total, 1)' = 'Water impact t-1',
+           'l(gaseado_total, 2)' = 'Gassed t-2',
+           'l(gaseado_total, 1)' = 'Gassed t-1',
+           'l(disparos_total, 2)' = 'Shooting t-2',
+           'l(disparos_total, 1)' = 'Shooting t-1',
+           'l(events_total, 2)' = 'Protest events t-2', #with protest events
+           'l(events_total, 1)' = 'Protest events t-1')
+
+coefs2 <- c('l(atropello_total, 2)' = 'Hit by a car t-2',
+           'l(atropello_total, 1)' = 'Hit by a car t-1',
+           'l(amenaza_total, 2)' = 'Threats t-2',
+           'l(amenaza_total, 1)' = 'Threats t-1',
+           'l(invasion_ingreso_total, 2)' = 'Unauthorized entry/invasion t-2',
+           'l(invasion_ingreso_total, 1)' = 'Unauthorized entry/invasion t-1',
+           'l(detencion_total, 2)' = 'Arrest t-2',
+           'l(detencion_total, 1)' = 'Arrest t-1',
+           'l(golpiza_total, 2)' = 'Beating t-2',
+           'l(golpiza_total, 1)' = 'Beating t-1',
+           'l(mojado_guanaco_total, 2)' = 'Water impact t-2',
+           'l(mojado_guanaco_total, 1)' = 'Water impact t-1',
+           'l(gaseado_total, 2)' = 'Gassed t-2',
+           'l(gaseado_total, 1)' = 'Gassed t-1',
+           'l(disparos_total, 2)' = 'Shooting t-2',
+           'l(disparos_total, 1)' = 'Shooting t-1') #w/o protests
+
+modelplot(models, coef_omit = 'Interc', coef_map = coefs2) + 
+  geom_vline(xintercept = 0, color = 'orange')
+```
+
+Without showing t-2 in graphs
+
+```{r}
+coefs3 <- c('l(atropello_total, 1)' = 'Hit by a car t-1',
+           'l(amenaza_total, 1)' = 'Threats t-1',
+           'l(invasion_ingreso_total, 1)' = 'Unauthorized entry/invasion t-1',
+           'l(detencion_total, 1)' = 'Arrest t-1',
+           'l(golpiza_total, 1)' = 'Beating t-1',
+           'l(mojado_guanaco_total, 1)' = 'Water impact t-1',
+           'l(gaseado_total, 1)' = 'Gassed t-1',
+           'l(disparos_total, 1)' = 'Shooting t-1') #w/o protests
+
+coefplot1 <- modelplot(models, size = 0.2, fatten = 2,
+                       coef_omit = 'Interc', coef_map = coefs3) + 
+  geom_vline(xintercept = 0, color = 'gray') +
+  labs(y = "Type of repressive action") + xlim(c(-0.5,0.5))
+
+coefplot1
+
+ggsave("coefplot1.png", width = 15, height = 9, units = "cm")
+
+
+```
+
+## Instrumental variable analysis
+
+### Map
+
+Make a map that crosses use of cctv cameras en protests per municipality
+
+Separate the database so it only includes municipality (total), cctv, and protests
+
+```{r}
+map_db <- final_df3_all %>%
+  group_by(nombre_comuna) %>%
+  summarise(events_comuna = sum(events_total),
+            cctv_comuna = max(total_cctv))
+
+#Paste codigos comuna
+map_db %<>% left_join(codigos_territoriales, nombre_comuna = nombre_comuna)
+```
+
+Add coordenates
+
+```{r}
+chile_municipios <- sf::st_read("comunas.shp")
+
+#Modify codigos_comuna to do the join
+library(stringi)
+chile_municipios$codigo_comuna <- chile_municipios$cod_comuna
+chile_municipios$codigo_comuna <- stri_pad_left(chile_municipios$codigo_comuna, pad = "0",
+                                         width = 5)
+
+chile_municipios %<>% left_join(map_db, codigo_comuna = codigo_comuna)
+
+#Remove isla de pascua
+chile_municipios %<>% subset(nombre_comuna!="Isla de Pascua")
+```
+
+Create map
+
+```{r}
+# create classes
+data_bi_class <- bi_class(chile_municipios, 
+                          x = cctv_comuna, 
+                          y = events_comuna, style = "equal", dim = 3)
+
+table(data_bi_class$bi_class)
+```
+
+```{r}
+# create map
+map <- ggplot() +
+  geom_sf(data = data_bi_class, mapping = aes(fill = bi_class), color = "white", 
+          size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = "GrPink", dim = 3) +
+  bi_theme()
+
+map
+```
+
+```{r}
+# Creating legends
+legend <- bi_legend(pal = "GrPink",
+                    dim = 3,
+                    xlab = "Protest Events",
+                    ylab = "CCTV Cameras",
+                    size = 8)
+
+# Combine map with legend
+finalPlot <- ggdraw() +
+  draw_plot(map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.6, .65, 0.2, 0.2)
+
+finalPlot
+```
+
+### Test for assumptions
+
+Dos variables en las que usar la IV: disparos_total / golpiza_total
+
+Relevance
+
+```{r}
+# First stage regression 
+# disparos_total
+shooting_lag_1st <- feols(l(disparos_total,1) ~ l(events_total,1) +
+                         l(total_cctv,1), data = final_df3_all,
+                         panel.id = c("nombre_comuna", "date"))
+
+#golpiza_total
+beating_lag_1st <- feols(l(golpiza_total,1) ~ l(events_total,1) +
+                         l(total_cctv,1), data = final_df3_all,
+                         panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(shooting_lag_1st, beating_lag_1st),
+             stars = TRUE, output = "latex", title = "Relevance Criteria IV")
+
+
+# Wald test
+waldtest(shooting_lag_1st, update(shooting_lag_1st, . ~ . -l(total_cctv,1)),
+         vcov=function(x) vcovHC(x, method="white2", type="HC1"))
+
+waldtest(beating_lag_1st, update(beating_lag_1st, . ~ . -l(total_cctv,1)),
+         vcov=function(x) vcovHC(x, method="white2", type="HC1"))
+```
+
+Exclusion
+
+```{r}
+exclusion_iv <- feols(events_total ~ l(total_cctv,1) + l(events_total,1) | 
+                      nombre_comuna + date, data = final_df3_all,
+                      panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(exclusion_iv), 
+             stars = c('*' = .1, '**' = .05, '***' = .01),
+             output = "latex", 
+             title = "Baseline model")
+```
+
+Exogeneity
+
+### 2SLS
+
+With instrumental variables
+
+```{r}
+iv_shooting <- feols(events_total ~ l(events_total,1:2)  | 
+                     nombre_comuna + date | l(disparos_total,1) ~ l(total_cctv,1),
+                     data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+summary(iv_shooting, stage = 2:1)
+
+iv_beating <- feols(events_total ~ l(events_total,1) + l(events_total,2) | 
+                    nombre_comuna + date | l(golpiza_total,1) ~ l(total_cctv,1),
+                    cluster = ~nombre_comuna+date,
+                    data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+summary(iv_beating, stage = 2:1)
+
+modelsummary(list(iv_shooting, iv_beating), 
+             stars = TRUE, output = "markdown")
+```
+
+Using PLM
+
+Second stage
+
+```{r}
+final_df3_all_ts <- pdata.frame(final_df3_all, index = c("nombre_comuna", "date"))
+
+iv_shooting_plm <- plm(events_total ~ lag(disparos_total,1)  + 
+                         lag(events_total,1:2)  | lag(events_total,1:2) + 
+                         lag(total_cctv,1), #events exo
+                         data = final_df3_all_ts, index=c("nombre_comuna", "date"),
+                         model = "within", effect = "twoways")
+
+iv_beating_plm <- plm(events_total ~ lag(golpiza_total,1)  + 
+                         lag(events_total,1:2) | lag(events_total,1:2)  + 
+                        lag(total_cctv,1), #events exo
+                         data = final_df3_all_ts, index=c("nombre_comuna", "date"),
+                         model = "within", effect = "twoways")
+
+
+stargazer(iv_shooting_plm, iv_beating_plm,
+          single.row = FALSE, type = "text")
+```
+
+First stage
+
+```{r message=FALSE, warning=TRUE}
+iv_shooting_plm_1stage <- plm(disparos_total ~ events_total +
+                         lag(events_total,1) + total_cctv, #events exo
+                         data = final_df3_all_ts, index=c("nombre_comuna", "date"),
+                         model = "within", effect = "twoways")
+
+iv_beating_plm_1stage <- plm(golpiza_total ~ events_total +
+                         lag(events_total,1) + total_cctv, #events exo
+                         data = final_df3_all_ts, index=c("nombre_comuna", "date"),
+                         model = "within", effect = "twoways")
+
+stargazer(iv_shooting_plm_1stage, iv_beating_plm_1stage,
+          single.row = FALSE, type = "text")
+```
+
+```{r}
+# Wald test
+waldtest(iv_shooting_plm_1stage, update(iv_shooting_plm_1stage, . ~ . -total_cctv),
+         vcov=function(x) vcovHC(x, method="white2", type="HC1"))
+
+waldtest(iv_beating_plm_1stage, update(iv_beating_plm_1stage, . ~ . -total_cctv),
+         vcov=function(x) vcovHC(x, method="white2", type="HC1"))
+```
+
+## Binary models
+
+Transform final_df3_all_ts database into binary variables
+
+```{r}
+db_binary <- final_df3_all_ts %>%
+  mutate(across(c(6:37), ~ case_when(. >= "1" ~ "1",
+                                     . == "0" ~ "0")))
+
+```
+
+```{r}
+model_lag2_binary <- feols(events_total ~ l(events_total,1) + l(events_total,2) + 
+                l(disparos_total,1) + l(gaseado_total,1) + 
+                l(mojado_guanaco_total,1) + l(golpiza_total,1) + l(detencion_total,1) + 
+                l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) + l(disparos_total,2) + l(gaseado_total,2) + 
+                l(mojado_guanaco_total,2) + l(golpiza_total,2) + l(detencion_total,2) + 
+                l(invasion_ingreso_total,2) + l(amenaza_total,2) + 
+                l(atropello_total,2)| nombre_comuna + date,
+                data = db_binary, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model_lag2_binary), 
+             stars = c('*' = .1, '**' = .05, '***' = .01), 
+             output = "latex", title = "Model with binary repressive actions")
+```
+
+## Count models
+
+First, examine the residuals of the OLS model
+
+```{r}
+ggplot(final_df3_all_daily, aes(x=events_total)) + geom_histogram()
+```
+
+Estimate new models with weeks instead
+
+```{r}
+model_lag1_c <- feols(events_total ~ l(events_total,1) + l(disparos_total,1) + 
+                l(gaseado_total,1) + l(mojado_guanaco_total,1) + l(golpiza_total,1) +
+                l(detencion_total,1) + l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) | nombre_comuna + week,
+                data = final_df3_all_weekly_comuna, panel.id = c("nombre_comuna", "week"))
+
+model_lag2_c <- feols(events_total ~ l(events_total,1) + l(events_total,2) + 
+                l(disparos_total,1) + l(gaseado_total,1) + 
+                l(mojado_guanaco_total,1) + l(golpiza_total,1) + l(detencion_total,1) + 
+                l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) + l(disparos_total,2) + l(gaseado_total,2) + 
+                l(mojado_guanaco_total,2) + l(golpiza_total,2) + l(detencion_total,2) + 
+                l(invasion_ingreso_total,2) + l(amenaza_total,2) + 
+                l(atropello_total,2)| nombre_comuna + week,
+                data = final_df3_all_weekly_comuna, panel.id = c("nombre_comuna", "week"))
+
+modelsummary(list(model_lag1_c, model_lag2_c), 
+             stars = c('*' = .1, '**' = .05, '***' = .01), 
+             output = "markdown", title = "Models with lags")
+```
+
+```{r}
+install.packages("GLMMadaptive")
+library(GLMMadaptive)
+
+
+model_lag1_glm <- feglm(events_total ~ l(events_total,1) + l(disparos_total,1) + 
+                l(gaseado_total,1) + l(mojado_guanaco_total,1) + l(golpiza_total,1) +
+                l(detencion_total,1) + l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) | nombre_comuna + date, family = quasipoisson(link = "log"),
+                data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_lag2_glm <- feglm(events_total ~ l(events_total,1) + l(events_total,2) + 
+                l(disparos_total,1) + l(gaseado_total,1) + 
+                l(mojado_guanaco_total,1) + l(golpiza_total,1) + l(detencion_total,1) + 
+                l(invasion_ingreso_total,1) + l(amenaza_total,1) + 
+                l(atropello_total,1) + l(disparos_total,2) + l(gaseado_total,2) + 
+                l(mojado_guanaco_total,2) + l(golpiza_total,2) + l(detencion_total,2) + 
+                l(invasion_ingreso_total,2) + l(amenaza_total,2) + 
+                l(atropello_total,2)| nombre_comuna + date, family = quasipoisson(link = "log"),
+                data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model_lag1_glm, model_lag2_glm), 
+             stars = c('*' = .1, '**' = .05, '***' = .01), 
+             output = "markdown", title = "Models with lags")
+
+
+```
+
+# End
+
+Correlation map
+
+https://gist.github.com/rafapereirabr/5348193abf779625f5e8c5090776a228
+
+https://stackoverflow.com/questions/45177590/map-of-bivariate-spatial-correlation-in-r-bivariate-lisa
+
+https://www.youtube.com/watch?v=b3HtV2Mhmvk&ab_channel=BurkeyAcademy
+
+```{r}
+
+names(final_df3_all)
+```
+
++---------------+-----------------------+----------------------------+
+|               | Lawful                | Unlawful                   |
++===============+=======================+============================+
+| Equipped      | disparos_total\       | atropello_total\           |
+|               | guanaco_total\        | ataque_animales_total\     |
+|               | \                     | \                          |
+|               | gaseado_total\        | quemado_total\*            |
+|               | mojado_total          |                            |
++---------------+-----------------------+----------------------------+
+| Non-equipped  | detencion_total\      | amenaza_total\             |
+|               | invasion_hogar_total\ | asfixia_total\             |
+|               | ingreso_total         | piedrazo_total\            |
+|               |                       | estigmatizacion_total\     |
+|               | golpiza_total\*       | destruccion_objetos_total\ |
+|               |                       | obstruccion_total\         |
+|               |                       | tocaciones_total\          |
+|               |                       | seguimiento_total\         |
+|               |                       | desnudamiento_total        |
++---------------+-----------------------+----------------------------+
+
+Protocolo de uso de elementos de disuación: lanza agua, zorrillo, dispositivos químicos, escopeta antidisturbios, armas de fuego.
+
+### Creación nueva BBDD
+
+```{r}
+final_df3_all %<>%
+  rowwise() %>%
+  mutate(equipped_lawful = sum(c_across(disparos_total|guanaco_total|quemado_total|
+                                          gaseado_total|mojado_total)),
+         equipped_unlawful = sum(c_across(atropello_total|ataque_animales_total)),
+         nonequipped_lawful = sum(c_across(detencion_total|invasion_hogar_total|
+                                             ingreso_total|golpiza_total)),
+         nonequipped_unlawful = sum(c_across(amenaza_total|
+                                             asfixia_total|piedrazo_total|
+                                             estigmatizacion_total|
+                                             destruccion_objetos_total|
+                                             obstruccion_total|tocaciones_total|
+                                             seguimiento_total|
+                                             desnudamiento_total)))
+```
+
+### Estimación de modelos
+
+```{r}
+
+model_t1_1 <- feols(events_total ~ l(equipped_lawful,-1) | nombre_comuna + date, 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t1_2 <- feols(events_total ~ l(equipped_lawful,-1) + 
+                    l(equipped_unlawful,-1) | nombre_comuna + date, 
+                    data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t1_3 <- feols(events_total ~ l(equipped_lawful,-1) + 
+                    l(equipped_unlawful,-1) + l(nonequipped_lawful,-1) |
+                    nombre_comuna + date, data = final_df3_all, 
+                    panel.id = c("nombre_comuna", "date"))
+
+model_t1_4 <- feols(events_total ~ l(equipped_lawful,-1) + 
+                    l(equipped_unlawful,-1) + 
+                    l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1) |
+                    nombre_comuna + date,
+                    data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model_t1_1, model_t1_2, model_t1_3, model_t1_4), 
+             stars = TRUE, output = "markdown")
+```
+
+```{r}
+model_t2_1 <- feols(events_total ~ l(equipped_lawful,-1) + l(equipped_lawful,-2) |
+                      nombre_comuna + date, 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t2_2 <- feols(events_total ~ l(equipped_lawful,-1) + 
+                    l(equipped_unlawful,-1) + l(equipped_lawful,-2) + 
+                    l(equipped_unlawful,-2) | nombre_comuna + date,
+                    data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t2_3 <- feols(events_total ~ l(equipped_lawful,-1) +
+                    l(equipped_unlawful,-1) + l(nonequipped_lawful,-1) + 
+                    l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                    l(nonequipped_lawful,-2)| nombre_comuna + date, 
+                    data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t2_4 <- feols(events_total ~ l(equipped_lawful,-1) + 
+                    l(equipped_unlawful,-1) + l(nonequipped_lawful,-1) + 
+                    l(nonequipped_unlawful,-1) + l(equipped_lawful,-2) + 
+                    l(equipped_unlawful,-2) + l(nonequipped_lawful,-2) +
+                    l(nonequipped_unlawful,-2) | nombre_comuna + date,
+                    data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model_t2_1, model_t2_2, model_t2_3, model_t2_4), 
+             stars = TRUE, output = "markdown")
+```
+
+```{r}
+model_t3_1 <- feols(events_total ~ l(events_total,-1)  + l(events_total,-2) +
+                      l(events_total,-3) + + l(equipped_lawful,-1) + 
+                      l(equipped_lawful,-2) +
+                      l(equipped_lawful,-3)|
+                      nombre_comuna + date, vcov = "twoway", 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t3_2 <- feols(events_total ~ l(events_total,-1)  + l(events_total,-2) +
+                      l(events_total,-3) +
+                      l(equipped_lawful,-1) + l(equipped_unlawful,-1) +
+                      l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                      l(equipped_lawful,-3) + l(equipped_unlawful,-3)|
+                      nombre_comuna + date, vcov = "twoway", 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t3_3 <- feols(events_total ~ l(events_total,-1)  + l(events_total,-2) +
+                      l(events_total,-3) +
+                      l(equipped_lawful,-1) + l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(equipped_lawful,-2) + 
+                      l(equipped_unlawful,-2) +
+                      l(nonequipped_lawful,-2) + l(equipped_lawful,-3) + 
+                      l(equipped_unlawful,-3) +
+                      l(nonequipped_lawful,-3)|
+                      nombre_comuna + date, vcov = "twoway", 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+model_t3_4 <- feols(events_total ~ l(events_total,-1) +  + l(events_total,-2) +
+                      l(events_total,-3) +
+                      l(equipped_lawful,-1) + l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1) +
+                      l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                      l(nonequipped_lawful,-2) + l(nonequipped_unlawful,-2) +
+                      l(equipped_lawful,-3) + l(equipped_unlawful,-3) +
+                      l(nonequipped_lawful,-3) + l(nonequipped_unlawful,-3) |
+                      nombre_comuna + date, vcov = "twoway", 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model_t3_1, model_t3_2, model_t3_3, model_t3_4), 
+             stars = TRUE, output = "markdown")
+```
+
+Plot regression coefficients
+
+```{r}
+models <- list(
+  "T-1" = feols(events_total ~ l(events_total,-1) + l(equipped_lawful,-1) + 
+                  l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1)  |
+                      nombre_comuna + date, 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date")),
+  "T-2" = feols(events_total ~ l(events_total,-1) + l(events_total,-2) +
+                  l(equipped_lawful,-1) + l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1) +
+                      l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                      l(nonequipped_lawful,-2) + l(nonequipped_unlawful,-2) |
+                      nombre_comuna + date, 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date")),
+  "T-3" = feols(events_total ~ l(events_total,-1) + l(events_total,-2) +
+                  l(events_total,-3) +
+                  l(equipped_lawful,-1) + l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1) +
+                      l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                      l(nonequipped_lawful,-2) + l(nonequipped_unlawful,-2) +
+                      l(equipped_lawful,-3) + l(equipped_unlawful,-3) +
+                      l(nonequipped_lawful,-3) + l(nonequipped_unlawful,-3) |
+                      nombre_comuna + date, 
+                  data = final_df3_all, panel.id = c("nombre_comuna", "date")))
+
+coefs <- c('f(nonequipped_unlawful, 3)' = 'Nonequipped Unlawful t-3',
+           'f(nonequipped_unlawful, 2)' = 'Nonequipped Unlawful t-2',
+           'f(nonequipped_unlawful, 1)' = 'Nonequipped Unlawful t-1',
+           'f(nonequipped_lawful, 3)' = 'Nonequipped Lawful t-3',
+           'f(nonequipped_lawful, 2)' = 'Nonequipped Lawful t-2',
+           'f(nonequipped_lawful, 1)' = 'Nonequipped Lawful t-1',
+           'f(equipped_unlawful, 3)' = 'Equipped Unlawful t-3',
+           'f(equipped_unlawful, 2)' = 'Equipped Unlawful t-2',
+           'f(equipped_unlawful, 1)' = 'Equipped Unlawful t-1',
+           'f(equipped_lawful, 3)' = 'Equipped Lawful t-3',
+           'f(equipped_lawful, 2)' = 'Equipped Lawful t-2',
+           'f(equipped_lawful, 1)' = 'Equipped Lawful t-1',
+           'f(events_total, 3)' = 'Protest events t-3',
+           'f(events_total, 2)' = 'Protest events t-2',
+           'f(events_total, 1)' = 'Protest events t-1')
+
+
+modelplot(models, coef_omit = 'Interc', coef_map = coefs) + facet_grid(~model) + 
+  geom_vline(xintercept = 0, color = 'orange')
+```
+
+With standardized data
+
+```{r}
+#standardize all
+final_df3_all_st <- final_df3_all %>%
+    as_tibble() %>%
+    mutate(across(where(is.numeric), ~ . - mean(.)))
+head(final_df3_all_st)
+```
+
+```{r}
+{r}
+models_st <- list(
+  "T-1" = feols(events_total ~ l(events_total,-1) + l(equipped_lawful,-1) + 
+                  l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1)  |
+                      nombre_comuna + date, 
+                  data = final_df3_all_st, panel.id = c("nombre_comuna", "date")),
+  "T-2" = feols(events_total ~ l(events_total,-1) + l(equipped_lawful,-1) + 
+                  l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1) +
+                      l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                      l(nonequipped_lawful,-2) + l(nonequipped_unlawful,-2) |
+                      nombre_comuna + date, 
+                  data = final_df3_all_st, panel.id = c("nombre_comuna", "date")),
+  "T-3" = feols(events_total ~ l(events_total,-1) + l(equipped_lawful,-1) + 
+                  l(equipped_unlawful,-1) +
+                      l(nonequipped_lawful,-1) + l(nonequipped_unlawful,-1) +
+                      l(equipped_lawful,-2) + l(equipped_unlawful,-2) +
+                      l(nonequipped_lawful,-2) + l(nonequipped_unlawful,-2) +
+                      l(equipped_lawful,-3) + l(equipped_unlawful,-3) +
+                      l(nonequipped_lawful,-3) + l(nonequipped_unlawful,-3) |
+                      nombre_comuna + date, 
+                  data = final_df3_all_st, panel.id = c("nombre_comuna", "date")))
+
+
+modelplot(models_st, coef_omit = 'Interc', coef_map = coefs) + facet_grid(~model) + 
+  geom_vline(xintercept = 0, color = 'orange')
+```
+
+```{r}
+# summarize
+dat <- map_dfr(c(.8, .9, .99), function(x) {
+  modelplot(models, conf_level = x, draw = FALSE,  coef_omit = 'Interc', coef_map = coefs) %>%
+  mutate(.width = x)
+})
+
+# plot
+ggplot(dat, aes(
+    y = term, x = estimate,
+    xmin = conf.low, xmax = conf.high,
+    color = model)) +
+  ggdist::geom_pointinterval(
+    position = "dodge",
+    interval_size_range = c(1, 2),
+    fatten_point = .1) + 
+  geom_vline(xintercept = 0, color = 'orange')
+```
+
+### With instrumental variable
+
+    feols(y ~ 1 | fe | x_endo ~ x_inst, base)
+
+```{r}
+model_iv_1 <- feols(events_total ~ l(equipped_lawful,-1)  |
+                      nombre_comuna + date | l(events_total,-1) ~ l(total_cctv,-1), 
+                  data = final_df3_all_st, panel.id = c("nombre_comuna", "date"))
+
+model_iv_2 <- feols(events_total ~ l(nonequipped_unlawful,-1) |
+                      nombre_comuna + date | l(events_total,-1) ~ l(total_cctv,-1), 
+                  data = final_df3_all_st, panel.id = c("nombre_comuna", "date"))
+
+modelsummary(list(model_iv_1,model_iv_2), stars = TRUE)
+```
+
+https://vincentarelbundock.github.io/modelsummary/articles/modelplot.html
